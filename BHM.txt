@@ -1,0 +1,319 @@
+# 9) Pooled, unpooled, and partial-pooling logistic models (Polars)
+# Expected existing objects: X_train, X_test, y_train, y_test
+
+RANDOM_SEED = 42
+rng = np.random.default_rng(RANDOM_SEED)
+
+id_col = "obligor_id"
+date_col = "date"  # year integer
+
+def to_numpy_1d(y):
+    if isinstance(y, pl.Series) or isinstance(y, pl.DataFrame):
+        return y.to_numpy().reshape(-1)
+    return np.asarray(y).reshape(-1)
+
+def score(y_true, p_hat, model_name):
+    p_hat = np.clip(np.asarray(p_hat), 1e-6, 1 - 1e-6)
+    out = {"model": model_name}
+    try:
+        out["roc_auc"] = float(roc_auc_score(y_true, p_hat))
+    except ValueError:
+        out["roc_auc"] = float("nan")
+    out["pr_auc"] = float(average_precision_score(y_true, p_hat))
+    out["brier"] = float(brier_score_loss(y_true, p_hat))
+    out["log_loss"] = float(log_loss(y_true, p_hat))
+    return out
+
+def sample_with_fallback(**kwargs):
+    try:
+        return pm.sample(nuts_sampler="numpyro", **kwargs)
+    except Exception as exc:
+        print("numpyro sampler unavailable, falling back to default NUTS. Reason:", str(exc))
+        return pm.sample(**kwargs)
+
+def fit_checks(name, idata_prior, idata_post, idata_ppc, y_obs):
+    """Concise convergence + calibration check."""
+    diag = az.summary(idata_post, kind="diagnostics")
+    prior_pred = idata_prior.prior_predictive["y_obs"].mean(dim=["chain", "draw"]).values
+    post_pred = idata_ppc.posterior_predictive["y_obs"].mean(dim=["chain", "draw"]).values
+    
+    print(f"\n{name:30} | max_rhat={float(diag['r_hat'].max()):.4f} | ess_bulk={float(diag['ess_bulk'].min()):.0f}")
+    print(f"  Prior PD:     {np.nanquantile(prior_pred, [0.05, 0.50, 0.95]).round(4)}")
+    print(f"  Obs rate:     {float(y_obs.mean()):.4f}")
+    print(f"  Posterior PD: {np.nanquantile(post_pred, [0.05, 0.50, 0.95]).round(4)}")
+
+def extract_posterior_subsample(posterior, var_names, max_samples=120, rng_obj=None):
+    """Stack chains/draws and optionally subsample for speed."""
+    rng_obj = rng_obj or np.random.default_rng(RANDOM_SEED)
+    result = {}
+    for var in var_names:
+        arr = posterior[var].stack(sample=("chain", "draw")).values
+        if max_samples and arr.shape[-1] > max_samples:
+            idx = rng_obj.choice(arr.shape[-1], size=max_samples, replace=False)
+            result[var] = np.take(arr, idx, axis=-1)
+        else:
+            result[var] = arr
+    return result
+
+def mean_prob_models(alpha_obs, slope_obs, xs, Xb, beta_b):
+    """Vectorized calculation without chunking. Uses einsum for speed."""
+    logits = alpha_obs + slope_obs * xs[:, None] + np.einsum('nf,fs->ns', Xb, beta_b)
+    return expit(logits).mean(axis=1)
+
+# ---------------- Data prep ----------------
+if not isinstance(X_train, pl.DataFrame) or not isinstance(X_test, pl.DataFrame):
+    raise TypeError("X_train and X_test must be Polars DataFrame.")
+
+covariate_cols = [c for c in X_train.columns if c not in [id_col, date_col]]
+Xtr = X_train.select(covariate_cols).to_numpy()
+Xte = X_test.select(covariate_cols).to_numpy()
+ytr = to_numpy_1d(y_train).astype(int)
+yte = to_numpy_1d(y_test).astype(int)
+
+oid_tr = X_train.get_column(id_col).cast(pl.Utf8).to_numpy()
+oid_te = X_test.get_column(id_col).cast(pl.Utf8).to_numpy()
+year_te = X_test.get_column(date_col).cast(pl.Int32).to_numpy()
+
+if not (np.isfinite(Xtr).all() and np.isfinite(Xte).all()):
+    raise ValueError("Non-finite values found in X_train/X_test.")
+
+scaler = StandardScaler()
+Xtr_s = scaler.fit_transform(Xtr)
+Xte_s = scaler.transform(Xte)
+P = Xtr_s.shape[1]
+
+base_pd = np.clip(ytr.mean(), 0.005, 0.20)
+alpha_mu = logit(base_pd)
+
+sample_cfg = dict(
+    draws=1500, tune=1500, chains=4, target_accept=0.97,
+    random_seed=RANDOM_SEED, idata_kwargs={"log_likelihood": True},
+)
+
+# ---------------- 1) Fully pooled ----------------
+with pm.Model() as pooled_model:
+    X = pm.Data("X", Xtr_s)
+    y = pm.Data("y", ytr)
+    alpha = pm.Normal("alpha", mu=alpha_mu, sigma=1.0)
+    beta = pm.Normal("beta", mu=0.0, sigma=1.0, shape=P)
+    eta = alpha + pm.math.dot(X, beta)
+    pm.Bernoulli("y_obs", logit_p=eta, observed=y)
+
+    idata_pooled_prior = pm.sample_prior_predictive(samples=500, random_seed=RANDOM_SEED)
+    idata_pooled = sample_with_fallback(**sample_cfg)
+    idata_pooled_ppc = pm.sample_posterior_predictive(idata_pooled, var_names=["y_obs"], random_seed=RANDOM_SEED)
+
+fit_checks("Fully pooled", idata_pooled_prior, idata_pooled, idata_pooled_ppc, ytr)
+
+post_p = extract_posterior_subsample(idata_pooled.posterior, ["alpha", "beta"], 120, rng)
+logits_pooled = post_p["alpha"][None, :] + Xte_s @ post_p["beta"]
+p_test_pooled = expit(logits_pooled).mean(axis=1)
+
+# ---------------- 2) Complete unpooled ----------------
+id_levels, id_train = np.unique(oid_tr, return_inverse=True)
+id_to_idx = {k: i for i, k in enumerate(id_levels)}
+id_test = np.array([id_to_idx.get(k, -1) for k in oid_te], dtype=int)
+seen_mask = id_test >= 0
+G_unpooled = len(id_levels)
+
+print("\nUnpooled model: train obligors =", G_unpooled)
+print("Unpooled model: seen test obligors =", int(seen_mask.sum()), "/", len(id_test))
+
+with pm.Model() as unpooled_model:
+    X = pm.Data("X", Xtr_s)
+    oid = pm.Data("oid", id_train)
+    y = pm.Data("y", ytr)
+    alpha = pm.Normal("alpha", mu=alpha_mu, sigma=1.5, shape=G_unpooled)
+    beta = pm.Normal("beta", mu=0.0, sigma=1.0, shape=(G_unpooled, P))
+    eta = alpha[oid] + pm.math.sum(beta[oid] * X, axis=1)
+    pm.Bernoulli("y_obs", logit_p=eta, observed=y)
+
+    idata_unpooled = sample_with_fallback(draws=300, tune=300, chains=2, target_accept=0.95, random_seed=RANDOM_SEED, idata_kwargs={"log_likelihood": True})
+
+diag_unpooled = az.summary(idata_unpooled, kind="diagnostics")
+print(f"Unpooled max_rhat = {float(diag_unpooled['r_hat'].max()):.4f} | ess_bulk = {float(diag_unpooled['ess_bulk'].min()):.0f}")
+
+p_test_unpooled = np.full(len(yte), base_pd, dtype=float)
+if seen_mask.any():
+    post_un = extract_posterior_subsample(idata_unpooled.posterior, ["alpha", "beta"], 80, rng)
+    seen_ids = id_test[seen_mask]
+    logits_seen = post_un["alpha"][seen_ids, :] + np.einsum("np,nps->ns", Xte_s[seen_mask], post_un["beta"][seen_ids, :, :])
+    p_test_unpooled[seen_mask] = expit(logits_seen).mean(axis=1)
+
+# ---------------- 3) Partial pooling A: varying intercept only ----------------
+levels, oid_idx_tr = np.unique(oid_tr, return_inverse=True)
+uniq_te, inv_te = np.unique(oid_te, return_inverse=True)
+G = len(levels)
+N_unseen = len(uniq_te)
+
+with pm.Model() as hier_int_model:
+    X = pm.Data("X", Xtr_s)
+    oid = pm.Data("oid", oid_idx_tr)
+    y = pm.Data("y", ytr)
+
+    alpha0 = pm.Normal("alpha0", mu=alpha_mu, sigma=1.0)
+    sigma_alpha = pm.HalfNormal("sigma_alpha", sigma=1.0)
+    z_alpha = pm.Normal("z_alpha", mu=0.0, sigma=1.0, shape=G)
+    alpha = pm.Deterministic("alpha", alpha0 + sigma_alpha * z_alpha)
+    beta = pm.Normal("beta", mu=0.0, sigma=1.0, shape=P)
+    
+    eta = alpha[oid] + pm.math.dot(X, beta)
+    pm.Bernoulli("y_obs", logit_p=eta, observed=y)
+
+    idata_prior_a = pm.sample_prior_predictive(samples=500, random_seed=RANDOM_SEED)
+    idata_a = sample_with_fallback(**sample_cfg)
+    idata_ppc_a = pm.sample_posterior_predictive(idata_a, var_names=["y_obs"], random_seed=RANDOM_SEED)
+
+fit_checks("PP intercept-only", idata_prior_a, idata_a, idata_ppc_a, ytr)
+
+sa_dict = extract_posterior_subsample(idata_a.posterior, ["alpha0", "sigma_alpha", "beta"], 120, rng)
+alpha0_a, sigma_a, beta_a = sa_dict["alpha0"], sa_dict["sigma_alpha"], sa_dict["beta"]
+
+eps_a = rng.normal(size=(N_unseen, alpha0_a.shape[0]))
+alpha_te_a = alpha0_a[None, :] + sigma_a[None, :] * eps_a
+alpha_obs_a = alpha_te_a[inv_te, :]
+
+p_te_a = mean_prob_models(alpha_obs_a, np.zeros_like(alpha_obs_a), Xte_s[:, 0], Xte_s, beta_a)
+
+# ---------------- 4) Partial pooling B: varying intercept + slope ----------------
+slope_col = "n_1" if "n_1" in covariate_cols else covariate_cols[0]
+s_idx = covariate_cols.index(slope_col)
+
+Xb_tr, Xb_te = np.delete(Xtr_s, s_idx, axis=1), np.delete(Xte_s, s_idx, axis=1)
+xs_tr, xs_te = Xtr_s[:, s_idx], Xte_s[:, s_idx]
+
+with pm.Model() as hier_int_slope_model:
+    Xb = pm.Data("Xb", Xb_tr)
+    xs = pm.Data("xs", xs_tr)
+    oid = pm.Data("oid", oid_idx_tr)
+    y = pm.Data("y", ytr)
+
+    alpha0 = pm.Normal("alpha0", mu=alpha_mu, sigma=1.0)
+    sigma_alpha = pm.HalfNormal("sigma_alpha", sigma=1.0)
+    z_alpha = pm.Normal("z_alpha", mu=0.0, sigma=1.0, shape=G)
+    alpha = pm.Deterministic("alpha", alpha0 + sigma_alpha * z_alpha)
+
+    mu_s = pm.Normal("mu_s", mu=0.0, sigma=1.0)
+    sigma_s = pm.HalfNormal("sigma_s", sigma=1.0)
+    z_s = pm.Normal("z_s", mu=0.0, sigma=1.0, shape=G)
+    beta_s = pm.Deterministic("beta_s", mu_s + sigma_s * z_s)
+
+    beta_b = pm.Normal("beta_b", mu=0.0, sigma=1.0, shape=Xb_tr.shape[1])
+    eta = alpha[oid] + beta_s[oid] * xs + pm.math.dot(Xb, beta_b)
+    pm.Bernoulli("y_obs", logit_p=eta, observed=y)
+
+    idata_prior_b = pm.sample_prior_predictive(samples=500, random_seed=RANDOM_SEED)
+    idata_b = sample_with_fallback(**sample_cfg)
+    idata_ppc_b = pm.sample_posterior_predictive(idata_b, var_names=["y_obs"], random_seed=RANDOM_SEED)
+
+fit_checks("PP intercept+slope", idata_prior_b, idata_b, idata_ppc_b, ytr)
+
+sb_dict = extract_posterior_subsample(idata_b.posterior, ["alpha0", "sigma_alpha", "mu_s", "sigma_s", "beta_b"], 120, rng)
+alpha0_b, sigma_ab, mu_s_b, sigma_s_b, beta_b_s = sb_dict["alpha0"], sb_dict["sigma_alpha"], sb_dict["mu_s"], sb_dict["sigma_s"], sb_dict["beta_b"]
+
+eps_alpha_b = rng.normal(size=(N_unseen, alpha0_b.shape[0]))
+eps_slope_b = rng.normal(size=(N_unseen, alpha0_b.shape[0]))
+alpha_te_b = alpha0_b[None, :] + sigma_ab[None, :] * eps_alpha_b
+slope_te_b = mu_s_b[None, :] + sigma_s_b[None, :] * eps_slope_b
+alpha_obs_b, slope_obs_b = alpha_te_b[inv_te, :], slope_te_b[inv_te, :]
+
+p_te_b = mean_prob_models(alpha_obs_b, slope_obs_b, xs_te, Xb_te, beta_b_s)
+
+# ---------------- 5) Metrics Collection ----------------
+models_to_score = [
+    ("Fully pooled", p_test_pooled),
+    ("Unpooled", p_test_unpooled),
+    ("PP intercept", p_te_a),
+    (f"PP intercept+slope({slope_col})", p_te_b),
+]
+metrics_all = pl.DataFrame([score(yte, p, name) for name, p in models_to_score]).sort("pr_auc", descending=True)
+
+print("\nTrain/test holdout metrics:")
+print(metrics_all)
+
+# ---------------- 6) LOO Comparison ----------------
+loo_a = az.loo(idata_a, pointwise=True)
+loo_b = az.loo(idata_b, pointwise=True)
+loo_table = pl.DataFrame([
+    {"model": "PP intercept", "elpd_loo": float(loo_a.elpd_loo), "se": float(loo_a.se), "p_loo": float(loo_a.p_loo)},
+    {"model": f"PP intercept+slope({slope_col})", "elpd_loo": float(loo_b.elpd_loo), "se": float(loo_b.se), "p_loo": float(loo_b.p_loo)},
+]).sort("elpd_loo", descending=True)
+
+print("\nLOO summary (higher elpd_loo is better):")
+print(loo_table)
+print("\nLOO pairwise compare:")
+print(az.compare({"PP intercept": idata_a, f"PP intercept+slope({slope_col})": idata_b}, method="BB-pseudo-BMA"))
+
+# ---------------- 7) Diagnostic Plots ----------------
+def draws_model_a(rows):
+    return expit(alpha_obs_a[rows, :] + Xte_s[rows] @ beta_a)
+
+def draws_model_b(rows):
+    return expit(alpha_obs_b[rows, :] + slope_obs_b[rows, :] * xs_te[rows, None] + Xb_te[rows] @ beta_b_s)
+
+def plot_obligor_paths(obligor_ids, title):
+    n = len(obligor_ids)
+    fig, axes = plt.subplots(n, 1, figsize=(12, 2.6 * n), sharex=False)
+    if n == 1: axes = [axes]
+
+    for ax, oid_v in zip(axes, obligor_ids):
+        rows = np.where(oid_te == oid_v)[0]
+        rows = rows[np.argsort(year_te[rows])]
+        x = year_te[rows]
+
+        ax.scatter(x, yte[rows], color="black", s=12, alpha=0.45, label="observed")
+
+        for draws, lbl, c in [(draws_model_a(rows), "PP intercept", "#1f77b4"), 
+                              (draws_model_b(rows), f"PP intercept+slope({slope_col})", "#d62728")]:
+            m = draws.mean(axis=1)
+            l, h = np.quantile(draws, [0.10, 0.90], axis=1)
+            ax.plot(x, m, color=c, lw=1.2, label=lbl)
+            ax.fill_between(x, l, h, color=c, alpha=0.15)
+
+        ax.set_title(f"{title} | obligor={oid_v}")
+        ax.set_ylim(-0.02, 1.02)
+        ax.legend(loc="upper right", fontsize=7)
+
+    axes[-1].set_xlabel("year")
+    plt.tight_layout()
+    plt.show()
+
+def plot_obligor_calibration(obligor_ids, title):
+    rows = []
+    for oid_v in obligor_ids:
+        m = oid_te == oid_v
+        rows.append({
+            "obligor_id": oid_v,
+            "count": int(m.sum()),
+            "obs_rate": float(yte[m].mean()),
+            "pred_pp_intercept": float(p_te_a[m].mean()),
+            "pred_pp_intercept_slope": float(p_te_b[m].mean()),
+        })
+
+    d = pl.DataFrame(rows)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    ax.scatter(d["pred_pp_intercept"], d["obs_rate"], s=45, label="PP intercept")
+    ax.scatter(d["pred_pp_intercept_slope"], d["obs_rate"], s=45, marker="x", label=f"PP intercept+slope({slope_col})")
+    
+    for r in d.iter_rows(named=True):
+        ax.text(r["pred_pp_intercept_slope"], r["obs_rate"], str(r["obligor_id"]), fontsize=7, alpha=0.75)
+        
+    ax.plot([0, 1], [0, 1], "k--", lw=1)
+    ax.set(xlim=(0, 1), ylim=(0, 1), xlabel="mean predicted PD", ylabel="observed default rate", title=f"Obligor-level calibration | {title}")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+n_plot = min(6, len(uniq_te))
+random_ids = pl.Series("obligor_id", uniq_te).sample(n=n_plot, with_replacement=False, seed=RANDOM_SEED).to_list()
+worst_ids = (pl.DataFrame({"obligor_id": oid_te, "y": yte, "p": p_te_b})
+             .group_by("obligor_id")
+             .agg(obs_rate=pl.col("y").mean(), pred_rate=pl.col("p").mean())
+             .with_columns(abs_gap=(pl.col("obs_rate") - pl.col("pred_rate")).abs())
+             .sort("abs_gap", descending=True)
+             .head(n_plot)["obligor_id"].to_list())
+
+plot_obligor_paths(random_ids, "Random sample")
+plot_obligor_paths(worst_ids, "Worst-fit sample")
+plot_obligor_calibration(random_ids, "Random sample")
+plot_obligor_calibration(worst_ids, "Worst-fit sample")
