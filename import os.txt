@@ -1,0 +1,51 @@
+import os
+import arviz as az
+
+model_files = {
+    'pooled': 'model_pooled.nc',
+    'unpooled': 'model_unpooled.nc',
+    'partial_intercept': 'model_partial_int.nc',
+    'partial_slope': 'model_partial_slope.nc'
+}
+
+models = {}
+
+print("Checking for existing model files...")
+for name, filename in model_files.items():
+    if os.path.exists(filename):
+        print(f"  [+] Loading '{name}' from {filename}...")
+        models[name] = az.from_netcdf(filename)
+    else:
+        print(f"  [-] '{name}' not found on disk. Will need to be sampled.")
+
+if 'pooled' not in models:
+    with pm.Model() as model_pooled:
+        # ... your priors and likelihood here ...
+        
+        # 1. Sample Prior
+        idata_prior = pm.sample_prior_predictive(random_seed=RANDOM_SEED)
+        
+        # 2. Sample Posterior
+        idata_post = pm.sample(random_seed=RANDOM_SEED)
+        
+        # 3. Combine them into one object!
+        idata_post.extend(idata_prior)
+        
+        # Store in our dictionary
+        models['pooled'] = idata_post
+
+import os
+import arviz as az
+
+print("Saving models to disk...")
+for name, idata_obj in models.items():
+    filename = model_files[name]
+    
+    # Remove existing file to prevent NetCDF overwrite conflicts
+    if os.path.exists(filename):
+        os.remove(filename)
+        
+    print(f"  -> Saving '{name}' to {filename} (Includes: {', '.join(idata_obj.groups())})")
+    az.to_netcdf(idata_obj, filename)
+
+print("All models saved successfully!")
