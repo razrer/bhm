@@ -1,0 +1,204 @@
+```python
+import polars as pl
+import numpy as np
+import pymc as pm
+import arviz as az
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from scipy.special import expit
+
+# -------------------------------------------------------------
+# 1. Simulate the Data (Polars)
+# 4 covariates (n_1..n_4), 1 time dimension (date), obligor_id
+# -------------------------------------------------------------
+np.random.seed(42)
+n_obligors = 1000
+n_records_per_obligor = 10
+total_records = n_obligors * n_records_per_obligor
+
+df = pl.DataFrame({
+    "obligor_id": np.repeat(np.arange(n_obligors), n_records_per_obligor),
+    "date": np.tile(np.arange(n_records_per_obligor), n_obligors),
+    "n_1": np.random.randn(total_records),
+    "n_2": np.random.randn(total_records),
+    "n_3": np.random.randn(total_records),
+    "n_4": np.random.randn(total_records),
+})
+
+obligor_effects = np.random.randn(n_obligors) * 0.5
+latent = (
+    np.sin(df["date"].to_numpy() * 0.5) 
+    + 0.5 * df["n_1"].to_numpy() 
+    - 0.3 * df["n_2"].to_numpy() 
+    + obligor_effects[df["obligor_id"].to_numpy()]
+)
+p = 1 / (1 + np.exp(-latent))
+df = df.with_columns(pl.Series("y_obs", np.random.binomial(1, p)))
+
+# Train/Test Split (test obligors are completely unseen)
+train_df = df.filter(pl.col("obligor_id") < 800)
+test_df  = df.filter(pl.col("obligor_id") >= 800)
+
+feature_cols = ["date", "n_1", "n_2", "n_3", "n_4"]
+X_train_raw = train_df.select(feature_cols).to_numpy()
+X_test_raw  = test_df.select(feature_cols).to_numpy()
+
+y_train = train_df["y_obs"].to_numpy()
+y_test  = test_df["y_obs"].to_numpy()
+
+oid_train = train_df["obligor_id"].to_numpy()
+oid_test  = test_df["obligor_id"].to_numpy()
+
+# -------------------------------------------------------------
+# 2. Scale Features & Generate Inducing Points
+# -------------------------------------------------------------
+# GPs are highly sensitive to distances; we MUST scale time & covariates
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train_raw)
+X_test_scaled  = scaler.transform(X_test_raw)
+
+# Generate Inducing Points using K-Means on the SCALED data
+n_inducing = 100
+kmeans = KMeans(n_clusters=n_inducing, random_state=42).fit(X_train_scaled)
+Xu_init = kmeans.cluster_centers_
+
+# We need re-indexed OIDs for the PyMC shape arrays since we split the data
+unique_train_oids, oid_train_idx = np.unique(oid_train, return_inverse=True)
+n_train_obligors = len(unique_train_oids)
+
+# -------------------------------------------------------------
+# 3. Hierarchical Sparse GP
+# -------------------------------------------------------------
+with pm.Model() as hier_gp_model:
+    # 1. Sparse GP Component (ARD Lengthscales per feature)
+    ls = pm.Gamma("ls", alpha=2, beta=1, shape=X_train_scaled.shape[1])
+    cov_func = pm.gp.cov.ExpQuad(input_dim=X_train_scaled.shape[1], ls=ls)
+    gp = pm.gp.LatentApprox(cov_func=cov_func, approx="VFE")
+    f_train = gp.prior("f_train", X=X_train_scaled, Xu=Xu_init)
+    
+    # 2. Hierarchical Obligor Component
+    sigma_alpha = pm.HalfNormal("sigma_alpha", sigma=1.0)
+    z_alpha = pm.Normal("z_alpha", mu=0, sigma=1.0, shape=n_train_obligors)
+    alpha = pm.Deterministic("alpha", sigma_alpha * z_alpha)
+    
+    # 3. Likelihood
+    eta = f_train + alpha[oid_train_idx]
+    pm.Bernoulli("y", logit_p=eta, observed=y_train)
+
+    # Sample Model
+    idata_hier = pm.sample(draws=500, tune=500, target_accept=0.9, nuts_sampler="numpyro", random_seed=42)
+
+# --- SAVE THE MODEL TRACE ---
+# You can later load this using: idata_loaded = az.from_netcdf("hierarchical_gp_model.nc")
+az.to_netcdf(idata_hier, "hierarchical_gp_model.nc")
+
+
+# -------------------------------------------------------------
+# 4. Out-of-Sample Predictions (for strictly unseen obligors)
+# -------------------------------------------------------------
+with hier_gp_model:
+    # Add the test conditional to the graph
+    f_test = gp.conditional("f_test", Xnew=X_test_scaled)
+    # Generate the posterior predictive distributions for the GP test values
+    pred_trace = pm.sample_posterior_predictive(idata_hier, var_names=["f_test"], random_seed=42)
+
+# Extract GP latent predictions: shape (Draws, N_test)
+f_test_samples = pred_trace.posterior_predictive["f_test"].values.reshape(-1, X_test_scaled.shape[0])
+n_samples = f_test_samples.shape[0]
+
+# Extract the learned global scalar for hierarchical sigma: shape (Draws,)
+sigma_alpha_samples = idata_hier.posterior["sigma_alpha"].values.flatten()
+
+# Because test obligors are completely unseen, we draw an intercept for each new unseen obligor
+unique_test_oids, test_oid_idx = np.unique(oid_test, return_inverse=True)
+n_unseen_obligors = len(unique_test_oids)
+
+# Draw random normal effects for each unseen ID, scaled by the posterior sigma_alpha
+# shape: (Samples, Unseen Obligors)
+z_unseen = np.random.randn(n_samples, n_unseen_obligors)
+alpha_unseen = z_unseen * sigma_alpha_samples[:, None]
+
+# Map the unseen random intercepts back to every test row
+alpha_test_rows = alpha_unseen[:, test_oid_idx]
+
+# Combine GP latent + Unseen Hierarchical Draw
+eta_test = f_test_samples + alpha_test_rows
+
+# Convert log-odds to probabilties and take the mean across all draws
+prob_test_samples = expit(eta_test)
+y_pred_mean_test = prob_test_samples.mean(axis=0)
+
+print(f"Mean test prediction probability: {y_pred_mean_test.mean():.4f}")
+```
+
+import polars as pl
+import numpy as np
+from sklearn.metrics import mutual_info_score
+from plotnine import ggplot, aes, geom_line, geom_point, theme_bw, labs
+
+# 1. Simulate Dataset
+np.random.seed(42)
+n_customers = 50
+df = pl.DataFrame({
+    "customer_id": np.repeat(np.arange(n_customers), np.random.randint(20, 100, n_customers)),
+}).with_columns(
+    date=pl.date_range(pl.date(2023, 1, 1), pl.date(2023, 12, 31), "1d").sample(pl.len(), with_replacement=True),
+    binary_outcome=pl.lit(np.random.binomial(1, 0.3, size=3146))
+).sort(["customer_id", "date"])
+
+max_lag = 10
+
+# 2. Derive Lags
+df_lags = df.with_columns([
+    pl.col("binary_outcome").shift(lag).over("customer_id").alias(f"lag_{lag}")
+    for lag in range(1, max_lag + 1)
+])
+
+# 3. Calculate Autocorrelation and Autoinformation (Delayed Mutual Information)
+metrics = []
+
+for lag in range(1, max_lag + 1):
+    lag_col = f"lag_{lag}"
+    
+    # Drop rows where lag is null (start of series)
+    valid_pairs = df_lags.select(["binary_outcome", lag_col]).drop_nulls()
+    
+    y_true = valid_pairs["binary_outcome"].to_numpy()
+    y_lag = valid_pairs[lag_col].to_numpy()
+    
+    # Autocorrelation (Linear dependence)
+    autocorr = np.corrcoef(y_true, y_lag)[0, 1]
+    
+    # Autoinformation (Non-linear dependence / Shannon Information)
+    # The mutual_info_score between a variable and its lag IS autoinformation
+    autoinfo = mutual_info_score(y_true, y_lag) 
+    
+    metrics.append({
+        "lag": lag, 
+        "autocorrelation": autocorr, 
+        "autoinformation": autoinfo
+    })
+
+df_metrics = pl.DataFrame(metrics)
+
+# 4. Plot the curves
+df_metrics_long = df_metrics.melt(
+    id_vars="lag", 
+    value_vars=["autocorrelation", "autoinformation"],
+    variable_name="metric", 
+    value_name="score"
+).to_pandas()
+
+plot = (
+    ggplot(df_metrics_long, aes(x='lag', y='score', color='metric'))
+    + geom_line(size=1)
+    + geom_point(size=3)
+    + theme_bw()
+    + labs(
+        title="Autocorrelation vs Autoinformation (Time-Delayed MI)",
+        x="Lag (Steps)",
+        y="Score",
+        color="Metric"
+    )
+)
+print(plot)
