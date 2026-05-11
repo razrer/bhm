@@ -3,7 +3,6 @@ import polars as pl
 import numpy as np
 import pymc as pm
 import arviz as az
-from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from scipy.special import expit
 
@@ -50,31 +49,34 @@ oid_train = train_df["obligor_id"].to_numpy()
 oid_test  = test_df["obligor_id"].to_numpy()
 
 # -------------------------------------------------------------
-# 2. Scale Features & Generate Inducing Points
+# 2. Scale Features
 # -------------------------------------------------------------
 # GPs are highly sensitive to distances; we MUST scale time & covariates
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train_raw)
 X_test_scaled  = scaler.transform(X_test_raw)
 
-# Generate Inducing Points using K-Means on the SCALED data
-n_inducing = 100
-kmeans = KMeans(n_clusters=n_inducing, random_state=42).fit(X_train_scaled)
-Xu_init = kmeans.cluster_centers_
+# >>> CHANGED: Removed KMeans inducing points generation block here <<<
 
 # We need re-indexed OIDs for the PyMC shape arrays since we split the data
 unique_train_oids, oid_train_idx = np.unique(oid_train, return_inverse=True)
 n_train_obligors = len(unique_train_oids)
 
 # -------------------------------------------------------------
-# 3. Hierarchical Sparse GP
+# 3. Hierarchical Sparse/Approximate GP (Using HSGP)
 # -------------------------------------------------------------
 with pm.Model() as hier_gp_model:
-    # 1. Sparse GP Component (ARD Lengthscales per feature)
+    # 1. HSGP Component (ARD Lengthscales per feature)
     ls = pm.Gamma("ls", alpha=2, beta=1, shape=X_train_scaled.shape[1])
     cov_func = pm.gp.cov.ExpQuad(input_dim=X_train_scaled.shape[1], ls=ls)
-    gp = pm.gp.LatentApprox(cov_func=cov_func, approx="VFE")
-    f_train = gp.prior("f_train", X=X_train_scaled, Xu=Xu_init)
+    
+    # >>> CHANGED: Replace LatentApprox with HSGP <<<
+    # m is basis vectors per dimension. 5 dims * m=5 -> 5^5 = 3125 basis vectors.
+    m_per_dim = [5] * X_train_scaled.shape[1]
+    gp = pm.gp.HSGP(m=m_per_dim, c=1.5, cov_func=cov_func)
+    
+    # >>> CHANGED: Xu mapping is no longer passed; HSGP generates boundaries from X naturally <<<
+    f_train = gp.prior("f_train", X=X_train_scaled)
     
     # 2. Hierarchical Obligor Component
     sigma_alpha = pm.HalfNormal("sigma_alpha", sigma=1.0)
@@ -89,7 +91,6 @@ with pm.Model() as hier_gp_model:
     idata_hier = pm.sample(draws=500, tune=500, target_accept=0.9, nuts_sampler="numpyro", random_seed=42)
 
 # --- SAVE THE MODEL TRACE ---
-# You can later load this using: idata_loaded = az.from_netcdf("hierarchical_gp_model.nc")
 az.to_netcdf(idata_hier, "hierarchical_gp_model.nc")
 
 
@@ -97,9 +98,8 @@ az.to_netcdf(idata_hier, "hierarchical_gp_model.nc")
 # 4. Out-of-Sample Predictions (for strictly unseen obligors)
 # -------------------------------------------------------------
 with hier_gp_model:
-    # Add the test conditional to the graph
+    # >>> NO CHANGE NEEDED HERE: gp.conditional works identical for HSGP <<<
     f_test = gp.conditional("f_test", Xnew=X_test_scaled)
-    # Generate the posterior predictive distributions for the GP test values
     pred_trace = pm.sample_posterior_predictive(idata_hier, var_names=["f_test"], random_seed=42)
 
 # Extract GP latent predictions: shape (Draws, N_test)
@@ -114,7 +114,6 @@ unique_test_oids, test_oid_idx = np.unique(oid_test, return_inverse=True)
 n_unseen_obligors = len(unique_test_oids)
 
 # Draw random normal effects for each unseen ID, scaled by the posterior sigma_alpha
-# shape: (Samples, Unseen Obligors)
 z_unseen = np.random.randn(n_samples, n_unseen_obligors)
 alpha_unseen = z_unseen * sigma_alpha_samples[:, None]
 
@@ -129,6 +128,7 @@ prob_test_samples = expit(eta_test)
 y_pred_mean_test = prob_test_samples.mean(axis=0)
 
 print(f"Mean test prediction probability: {y_pred_mean_test.mean():.4f}")
+```
 ```
 
 import polars as pl
