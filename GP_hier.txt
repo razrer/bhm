@@ -1,0 +1,66 @@
+# -------------------------------------------------------------
+# 3. Hierarchical Sparse Additive GP (HSGP GAM)
+# -------------------------------------------------------------
+with pm.Model() as hier_gp_model:
+    f_train_total = 0 # We will sum the latent outputs here
+    
+    # Iterate through your 10 features to create a 1D GP for each
+    for j in range(X_train_scaled.shape[1]):
+        
+        # 1D lengthscale for the specific feature
+        ls_j = pm.Gamma(f"ls_{j}", alpha=2, beta=1)
+        
+        # We tell the covariance function to only look at column `j`
+        cov_j = pm.gp.cov.ExpQuad(input_dim=X_train_scaled.shape[1], active_dims=[j], ls=ls_j)
+        
+        # 1-Dimensional HSGP (m=[10] means 10 basis vectors per feature)
+        # 10 features * 10 vectors = only 100 total basis vectors! Extremely efficient.
+        gp_j = pm.gp.HSGP(m=[10], c=1.5, cov_func=cov_j)
+        
+        # Get the prior for this specific feature's GP
+        f_train_j = gp_j.prior(f"f_train_{j}", X=X_train_scaled)
+        
+        # Add it to the total latent function
+        f_train_total = f_train_total + f_train_j
+        
+    # 2. Hierarchical Obligor Component
+    sigma_alpha = pm.HalfNormal("sigma_alpha", sigma=1.0)
+    z_alpha = pm.Normal("z_alpha", mu=0, sigma=1.0, shape=n_train_obligors)
+    alpha = pm.Deterministic("alpha", sigma_alpha * z_alpha)
+    
+    # 3. Likelihood sum: (Feature 1 GP + Feature 2 GP ... + Feature 10 GP) + Obligor Intercept
+    eta = f_train_total + alpha[oid_train_idx]
+    pm.Bernoulli("y", logit_p=eta, observed=y_train)
+
+    # Sample Model
+    idata_hier = pm.sample(draws=500, tune=500, target_accept=0.9, nuts_sampler="numpyro", random_seed=42)
+
+az.to_netcdf(idata_hier, "hierarchical_gp_model.nc")
+
+# -------------------------------------------------------------
+# 4. Out-of-Sample Predictions (for Additive GP)
+# -------------------------------------------------------------
+with hier_gp_model:
+    f_test_total = 0
+    # Loop over features to build the test conditional for each 1D GP
+    for j in range(X_test_scaled.shape[1]):
+        # PyMC remembers the `gp_j` configurations tied to `f_train_j`
+        gp_j = hier_gp_model.components[f"f_train_{j}"] # Helper if you didn't save the gp objects, or rebuild them
+        # Wait, the safest way is to rebuild the conditional using the named parameters. 
+        # Alternatively, save the `gp_j` objects in a list during training!
+
+Safer Prediction Code (if you save the GPs in a list):
+Just modify the top block to save gps = [], append gp_j to it, and do this in the test block:
+
+with hier_gp_model:
+    f_test_total = 0
+    for j, gp_j in enumerate(gps): # Assume gps is a list you built in the training loop
+        f_test_j = gp_j.conditional(f"f_test_{j}", Xnew=X_test_scaled)
+        f_test_total = f_test_total + f_test_j
+        
+    # Name the final sum so posterior predictive can track it
+    f_test_sum = pm.Deterministic("f_test_sum", f_test_total)
+    pred_trace = pm.sample_posterior_predictive(idata_hier, var_names=["f_test_sum"], random_seed=42)
+
+# Extract GP latent predictions from the sum
+f_test_samples = pred_trace.posterior_predictive["f_test_sum"].values.reshape(-1, X_test_scaled.shape[0])
